@@ -1,0 +1,4 @@
+Keep the current Render start command so the web service binds to PORT:
+mkdir -p /tmp/h && (python -m http.server $PORT --directory /tmp/h &) ; exec python bot.py
+
+Node.js hosting requires Node.js and npm to be installed in the same runtime/image.
