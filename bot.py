@@ -1,321 +1,363 @@
 import asyncio
-import io
 import json
 import os
-import shutil
-import stat
-import sys
-import zipfile
-from pathlib import Path
 
 import discord
 from discord import app_commands
-from dotenv import dotenv_values, load_dotenv
+from dotenv import load_dotenv
 
 load_dotenv()
-import tools
-from agent import Agent
 
-ADMINS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
+import db  # noqa: E402
+import tools  # noqa: E402
+from agent import Agent, describe  # noqa: E402
+from ops import Ops, panel_embed, panel_view  # noqa: E402
+
+OWNERS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
+GUILD_IDS = [int(x) for x in os.getenv("GUILD_IDS", "").split(",") if x.strip()]
 ADMIN_CHANNEL = int(os.getenv("ADMIN_CHANNEL_ID", "0") or 0)
-HOST_ROOT = Path(os.getenv("HOST_ROOT", "/tmp/nexus-hosted"))
-MAX_ZIP = 25 * 1024 * 1024
-MAX_EXPANDED = 150 * 1024 * 1024
+MISSING = discord.utils.MISSING
 
 intents = discord.Intents.default()
-intents.message_content = True
-client = discord.Client(intents=intents, allowed_mentions=discord.AllowedMentions.none())
+intents.message_content = os.getenv("MESSAGE_CONTENT", "1") == "1"
+
+
+class Nexus(discord.Client):
+    async def setup_hook(self):
+        for uid in OWNERS:
+            await db.set_role(uid, "owner")
+        await agent.load()
+        if GUILD_IDS:
+            for g in GUILD_IDS:
+                tree.copy_global_to(guild=discord.Object(g))
+                print(f"synced {len(await tree.sync(guild=discord.Object(g)))} commands to guild {g}")
+        else:
+            print(f"synced {len(await tree.sync())} global commands (can take a while to appear)")
+        asyncio.create_task(ops.run())
+
+
+client = Nexus(intents=intents, allowed_mentions=discord.AllowedMentions.none())
 tree = app_commands.CommandTree(client)
 agent = Agent()
 locks = {}
-hosted = {}
 
 
-def is_admin(interaction):
-    return interaction.user.id in ADMINS
-
-
-def safe_project_env(root):
-    # Uploaded projects must not inherit Nexus or Render secrets.
-    env = {
-        "PATH": os.getenv("PATH", "/usr/local/bin:/usr/bin:/bin"),
-        "HOME": str(root), "LANG": os.getenv("LANG", "C.UTF-8"),
-        "PYTHONUNBUFFERED": "1", "NPM_CONFIG_UPDATE_NOTIFIER": "false",
-    }
-    env_file = root / ".env"
-    if env_file.is_file() and env_file.stat().st_size <= 65536:
-        for key, value in dotenv_values(env_file).items():
-            if key and value is not None and key.replace("_", "").isalnum():
-                env[key] = value
-    return env
-
-
-async def run_setup(args, cwd, timeout=240):
-    proc = await asyncio.create_subprocess_exec(
-        *args, cwd=str(cwd), env=safe_project_env(cwd),
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
-    )
-    try:
-        output, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
-        raise RuntimeError("Dependency installation timed out.")
-    result = output.decode(errors="replace")[-1600:]
-    if proc.returncode:
-        raise RuntimeError(result or f"Command failed with exit code {proc.returncode}.")
-    return result
-
-
-def safe_extract(zf, destination):
-    members = zf.infolist()
-    if len(members) > 2000:
-        raise ValueError("ZIP contains over 2,000 files.")
-    total = 0
-    for member in members:
-        name = member.filename.replace("\\", "/")
-        path = Path(name)
-        mode = member.external_attr >> 16
-        if path.is_absolute() or ".." in path.parts or (mode and stat.S_ISLNK(mode)):
-            raise ValueError("ZIP contains an unsafe path or symbolic link.")
-        if member.is_dir():
-            continue
-        total += member.file_size
-        if total > MAX_EXPANDED:
-            raise ValueError("ZIP expands beyond 150 MB.")
-        target = (destination / path).resolve()
-        if destination.resolve() not in target.parents:
-            raise ValueError("ZIP contains an unsafe path.")
-    zf.extractall(destination)
-
-
-def find_project_root(folder):
-    items = list(folder.iterdir())
-    if len(items) == 1 and items[0].is_dir():
-        nested = items[0]
-        markers = ("requirements.txt", "package.json", "main.py", "bot.py", "app.py", "index.js")
-        if any((nested / marker).exists() for marker in markers):
-            return nested
-    return folder
-
-
-async def send_channel(channel_id, text):
-    channel = client.get_channel(channel_id) or await client.fetch_channel(channel_id)
-    await channel.send(text[:2000])
+# ───────── plumbing ─────────
+async def _send(channel_id, text):
+    ch = client.get_channel(channel_id) or await client.fetch_channel(channel_id)
+    await ch.send(text[:2000])
     return f"sent to {channel_id}"
 
 
-async def notify_admins(text):
+async def notify(text=None, embed=None, view=None):
     if ADMIN_CHANNEL:
-        return await send_channel(ADMIN_CHANNEL, "Alert: " + text)
-    for user_id in ADMINS:
-        await (await client.fetch_user(user_id)).send(text[:2000])
+        ch = client.get_channel(ADMIN_CHANNEL) or await client.fetch_channel(ADMIN_CHANNEL)
+        return await ch.send(content=text, embed=embed, view=view or MISSING)
+    for uid in await db.owners():
+        try:
+            await (await client.fetch_user(uid)).send(content=text, embed=embed, view=view or MISSING)
+        except discord.HTTPException:
+            pass
+
+
+async def _notify_text(text):
+    await notify(text=f"🚨 {text}")
     return "admins notified"
 
 
-tools.SEND, tools.NOTIFY = send_channel, notify_admins
+tools.SEND, tools.NOTIFY = _send, _notify_text
+ops = Ops(client, notify, agent)
 
 
+def chunk(text):
+    return [text[i:i + 1900] for i in range(0, len(text), 1900)] or ["..."]
+
+
+async def run_agent(channel_id, user_id, text):
+    async with locks.setdefault(channel_id, asyncio.Lock()):
+        try:
+            reply = await agent.handle(channel_id, user_id, text)
+        except Exception as e:
+            print("agent error:", repr(e))
+            reply = f"Something broke on my side ({type(e).__name__}). Check the logs."
+    return chunk(reply), (Confirm(user_id, channel_id) if agent.has_pending(channel_id, user_id) else None)
+
+
+async def run_tool(send, name, args, user):
+    try:
+        out = await tools.call(name, args, user)
+    except PermissionError as e:
+        out = f"Denied: {e}"
+    except Exception as e:
+        out = f"Failed: {tools.redact(str(e))[:500]}"
+    await send(f"```\n{out[:1800]}\n```")
+
+
+class Confirm(discord.ui.View):
+    """Yes/No for LLM-initiated actions (the agent holds the pending action)."""
+    def __init__(self, user_id, channel_id):
+        super().__init__(timeout=600)
+        self.user_id, self.channel_id = user_id, channel_id
+
+    async def interaction_check(self, i):
+        return i.user.id == self.user_id
+
+    async def _go(self, i, answer):
+        await i.response.defer()
+        await i.edit_original_response(view=None)
+        chunks, view = await run_agent(self.channel_id, self.user_id, answer)
+        await i.followup.send(chunks[0], view=view or MISSING)
+        for c in chunks[1:]:
+            await i.followup.send(c)
+
+    @discord.ui.button(label="Yes", style=discord.ButtonStyle.danger)
+    async def yes(self, i, b):
+        await self._go(i, "yes")
+
+    @discord.ui.button(label="No", style=discord.ButtonStyle.secondary)
+    async def no(self, i, b):
+        await self._go(i, "no")
+
+
+class DirectConfirm(discord.ui.View):
+    """Yes/No for slash commands that call a tool directly."""
+    def __init__(self, user_id, name, args):
+        super().__init__(timeout=300)
+        self.user_id, self.name, self.args = user_id, name, args
+
+    async def interaction_check(self, i):
+        return i.user.id == self.user_id
+
+    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.danger)
+    async def yes(self, i, b):
+        await i.response.defer()
+        await i.edit_original_response(view=None)
+        await run_tool(i.followup.send, self.name, self.args, self.user_id)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def no(self, i, b):
+        await i.response.edit_message(content="Cancelled.", view=None)
+
+
+async def guard(i, need="viewer", ephemeral=False):
+    role = await db.get_role(i.user.id)
+    if not role or tools.RANK[role] < tools.RANK[need]:
+        await i.response.send_message(f"You need the **{need}** role for that.", ephemeral=True)
+        return None
+    await i.response.defer(thinking=True, ephemeral=ephemeral)  # must ack within 3s or Discord says "application didn't respond"
+    return role
+
+
+async def direct(i, name, args, confirm=False):
+    if not await guard(i, tools.NEEDS[name]):
+        return
+    if confirm and tools.needs_confirm(name, args):
+        return await i.followup.send(f"This will run `{describe(name, args)}`. Confirm?", view=DirectConfirm(i.user.id, name, args))
+    await run_tool(i.followup.send, name, args, i.user.id)
+
+
+async def bot_ac(i, current: str):
+    return [app_commands.Choice(name=b["name"], value=b["name"]) for b in tools.BOTS if current.lower() in b["name"].lower()][:25]
+
+
+# ───────── slash commands ─────────
+@tree.command(name="nexus", description="Talk to Nexus")
+@app_commands.describe(message="What do you need?")
+async def nexus_cmd(i: discord.Interaction, message: str):
+    if not await guard(i):
+        return
+    chunks, view = await run_agent(i.channel_id or i.user.id, i.user.id, message)
+    await i.followup.send(chunks[0], view=view or MISSING)
+    for c in chunks[1:]:
+        await i.followup.send(c)
+
+
+@tree.command(name="bots", description="List registered bots")
+async def bots_cmd(i: discord.Interaction):
+    await direct(i, "list_bots", {})
+
+
+@tree.command(name="stats", description="Server CPU/RAM/disk")
+async def stats_cmd(i: discord.Interaction):
+    await direct(i, "get_server_stats", {})
+
+
+@tree.command(name="incidents", description="Recent incidents")
+async def incidents_cmd(i: discord.Interaction):
+    await direct(i, "get_incidents", {})
+
+
+@tree.command(name="status", description="Status of a bot")
+@app_commands.describe(bot="Bot name")
+@app_commands.autocomplete(bot=bot_ac)
+async def status_cmd(i: discord.Interaction, bot: str):
+    await direct(i, "get_status", {"bot_id": bot})
+
+
+@tree.command(name="logs", description="Recent logs of a bot")
+@app_commands.autocomplete(bot=bot_ac)
+async def logs_cmd(i: discord.Interaction, bot: str, lines: app_commands.Range[int, 1, 40] = 15):
+    await direct(i, "get_logs", {"bot_id": bot, "lines": lines})
+
+
+@tree.command(name="diagnose", description="Diagnose a bot's latest error")
+@app_commands.autocomplete(bot=bot_ac)
+async def diagnose_cmd(i: discord.Interaction, bot: str):
+    await direct(i, "diagnose_error", {"bot_id": bot})
+
+
+@tree.command(name="start", description="Start a bot")
+@app_commands.autocomplete(bot=bot_ac)
+async def start_cmd(i: discord.Interaction, bot: str):
+    await direct(i, "start_bot", {"bot_id": bot})
+
+
+@tree.command(name="restart", description="Restart a bot")
+@app_commands.autocomplete(bot=bot_ac)
+async def restart_cmd(i: discord.Interaction, bot: str):
+    await direct(i, "restart_bot", {"bot_id": bot})
+
+
+@tree.command(name="stop", description="Stop a bot")
+@app_commands.autocomplete(bot=bot_ac)
+async def stop_cmd(i: discord.Interaction, bot: str):
+    await direct(i, "stop_bot", {"bot_id": bot}, confirm=True)
+
+
+@tree.command(name="deploy", description="Pull latest code, restart, auto-rollback if it fails")
+@app_commands.autocomplete(bot=bot_ac)
+async def deploy_cmd(i: discord.Interaction, bot: str):
+    await direct(i, "deploy_bot", {"bot_id": bot}, confirm=True)
+
+
+@tree.command(name="fix", description="Apply the proposed fix for a bot's open incident")
+@app_commands.autocomplete(bot=bot_ac)
+async def fix_cmd(i: discord.Interaction, bot: str):
+    if not await guard(i, "operator"):
+        return
+    b = tools._bot(bot)
+    inc = await db.latest_fix_incident(b["name"])
+    if not inc:
+        return await i.followup.send("No open incident with a proposed fix.")
+    ok, steps = await ops.apply_fix(b, json.loads(inc["fix"]), i.user.id)
+    await db.set_incident(inc["id"], "fixed" if ok else "escalated")
+    await i.followup.send(("✅ Fixed. " if ok else "❌ Still failing. ") + "; ".join(steps))
+
+
+@tree.command(name="panel", description="Post a live status panel in this channel")
+async def panel_cmd(i: discord.Interaction):
+    if not await guard(i, "operator", True):
+        return
+    msg = await i.channel.send(embed=await panel_embed(), view=panel_view())
+    await ops.add_panel(msg.channel.id, msg.id)
+    await i.followup.send("Panel posted. It refreshes automatically.", ephemeral=True)
+
+
+@tree.command(name="autofix", description="Set watchdog auto-fix mode")
+@app_commands.choices(mode=[app_commands.Choice(name=m, value=m) for m in ("off", "suggest", "auto")])
+async def autofix_cmd(i: discord.Interaction, mode: app_commands.Choice[str]):
+    await direct(i, "set_autofix", {"mode": mode.value})
+
+
+@tree.command(name="role", description="Set a user's role (owner only)")
+@app_commands.choices(role=[app_commands.Choice(name=r, value=r) for r in ("viewer", "operator", "owner", "none")])
+async def role_cmd(i: discord.Interaction, user: discord.User, role: app_commands.Choice[str]):
+    if not await guard(i, "owner", True):
+        return
+    if user.id in OWNERS and role.value != "owner":
+        return await i.followup.send("That user is a permanent owner (ADMIN_IDS).")
+    if role.value == "none":
+        await db.del_role(user.id)
+    else:
+        await db.set_role(user.id, role.value)
+    await db.audit(i.user.id, "set_role", {"user": user.id, "role": role.value}, True, "")
+    await i.followup.send(f"{user.display_name} → {role.value}")
+
+
+@tree.command(name="audit", description="Recent actions (owner only)")
+async def audit_cmd(i: discord.Interaction):
+    if not await guard(i, "owner", True):
+        return
+    import time
+    rows = await db.recent_audit(10)
+    lines = [f"{time.strftime('%m-%d %H:%M', time.gmtime(r['ts']))} <@{r['user_id']}> {r['action']} {'✅' if r['ok'] else '❌'} {r['args'][:60]}" for r in rows]
+    await i.followup.send("\n".join(lines) or "empty", ephemeral=True)
+
+
+@tree.command(name="simulate", description="Break a mock bot to test the watchdog (owner, mock backend only)")
+@app_commands.choices(kind=[app_commands.Choice(name=k, value=k) for k in ("missing_module", "crash", "loop", "bad_deploy")])
+@app_commands.autocomplete(bot=bot_ac)
+async def simulate_cmd(i: discord.Interaction, bot: str, kind: app_commands.Choice[str]):
+    if not await guard(i, "owner", True):
+        return
+    if tools.B.name != "mock":
+        return await i.followup.send("Only available on the mock backend.", ephemeral=True)
+    tools.B.simulate(tools._bot(bot), kind.value)
+    await i.followup.send(f"Simulated `{kind.value}` on {bot}. The watchdog notices within {os.getenv('WATCH_INTERVAL', '60')}s.", ephemeral=True)
+
+
+@tree.error
+async def on_tree_error(i: discord.Interaction, e: app_commands.AppCommandError):
+    print("command error:", repr(e))
+    try:
+        send = i.followup.send if i.response.is_done() else i.response.send_message
+        await send("Command failed. Check my logs.", ephemeral=True)
+    except discord.HTTPException:
+        pass
+
+
+# ───────── panel / alert buttons ─────────
+@client.event
+async def on_interaction(i: discord.Interaction):
+    if i.type != discord.InteractionType.component:
+        return
+    cid = (i.data or {}).get("custom_id", "")
+    if not cid.startswith("nx:"):
+        return
+    role = await db.get_role(i.user.id)
+    if not role:
+        return await i.response.send_message("Not allowed.", ephemeral=True)
+    parts = cid.split(":")
+    if parts[1] == "refresh":
+        await i.response.defer()
+        return await ops.refresh_message(i.message)
+    if tools.RANK[role] < tools.RANK["operator"]:
+        return await i.response.send_message("You need the **operator** role for that.", ephemeral=True)
+    await i.response.defer(ephemeral=True)
+    try:
+        if parts[1] == "restart":
+            await run_tool(lambda t: i.followup.send(t, ephemeral=True), "restart_bot", {"bot_id": parts[2]}, i.user.id)
+        elif parts[1] == "fix":
+            inc = await db.get_incident(int(parts[2]))
+            if not inc or inc["status"] not in ("open", "escalated"):
+                return await i.followup.send("That incident is already closed.", ephemeral=True)
+            ok, steps = await ops.apply_fix(tools._bot(inc["bot"]), json.loads(inc["fix"]), i.user.id)
+            await db.set_incident(inc["id"], "fixed" if ok else "escalated")
+            await i.followup.send(("✅ Fixed. " if ok else "❌ Still failing. ") + "; ".join(steps), ephemeral=True)
+    except Exception as e:
+        await i.followup.send(f"Failed: {tools.redact(str(e))[:300]}", ephemeral=True)
+
+
+# ───────── mentions / DMs ─────────
 @client.event
 async def on_ready():
-    HOST_ROOT.mkdir(parents=True, exist_ok=True)
-    try:
-        synced = await tree.sync()
-        print(f"Synced {len(synced)} Discord slash commands.")
-    except Exception as exc:
-        print(f"Slash command sync failed: {type(exc).__name__}: {exc}")
-    print(f"Nexus online as {client.user} | admins: {len(ADMINS)}")
-
-
-@tree.command(name="ping", description="Check whether Nexus is responding")
-async def ping(interaction: discord.Interaction):
-    await interaction.response.send_message(f"Pong! {round(client.latency * 1000)} ms", ephemeral=True)
-
-
-@tree.command(name="help", description="Show Nexus commands")
-async def help_command(interaction: discord.Interaction):
-    await interaction.response.send_message(
-        "**Nexus commands**\n/host — run a Python or Node.js ZIP\n/bots — list hosted projects\n"
-        "/status — check your project\n/logs — show recent output\n/stop — stop your project\n/ping — check Nexus",
-        ephemeral=True,
-    )
-
-
-@tree.command(name="host", description="Run a Python or Node.js project from a ZIP")
-@app_commands.describe(language="Project runtime", zip_file="ZIP archive containing project source")
-@app_commands.choices(language=[
-    app_commands.Choice(name="Python", value="python"),
-    app_commands.Choice(name="Node.js", value="nodejs"),
-])
-async def host(interaction: discord.Interaction, language: app_commands.Choice[str], zip_file: discord.Attachment):
-    if not is_admin(interaction):
-        await interaction.response.send_message("You are not authorized to host projects.", ephemeral=True)
-        return
-    if not zip_file.filename.lower().endswith(".zip") or zip_file.size > MAX_ZIP:
-        await interaction.response.send_message("Upload a ZIP file no larger than 25 MB.", ephemeral=True)
-        return
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    previous = hosted.get(interaction.user.id)
-    if previous and previous["process"].returncode is None:
-        await interaction.followup.send("You already have a running project. Use /stop first.", ephemeral=True)
-        return
-
-    project_dir = HOST_ROOT / str(interaction.user.id)
-    shutil.rmtree(project_dir, ignore_errors=True)
-    project_dir.mkdir(parents=True, exist_ok=True)
-    archive = None
-    try:
-        data = await zip_file.read()
-        if len(data) > MAX_ZIP:
-            raise ValueError("ZIP exceeds 25 MB.")
-        archive = zipfile.ZipFile(io.BytesIO(data))
-        safe_extract(archive, project_dir)
-        root = find_project_root(project_dir)
-
-        if language.value == "python":
-            entry = next((root / name for name in ("main.py", "bot.py", "app.py") if (root / name).is_file()), None)
-            if entry is None:
-                raise ValueError("Python ZIP must contain main.py, bot.py, or app.py.")
-            venv = root / ".nexus-venv"
-            await run_setup([sys.executable, "-m", "venv", str(venv)], root, timeout=90)
-            python_bin = venv / "bin" / "python"
-            requirements = root / "requirements.txt"
-            if requirements.is_file():
-                await run_setup([str(python_bin), "-m", "pip", "install", "--disable-pip-version-check", "-r", str(requirements)], root)
-            command = [str(python_bin), str(entry)]
-        else:
-            if not shutil.which("node") or not shutil.which("npm"):
-                raise RuntimeError("Node.js/npm is not installed in this Render runtime. Install Node.js alongside Python to use Node.js projects.")
-            package_file = root / "package.json"
-            if not package_file.is_file():
-                raise ValueError("Node.js ZIP must contain package.json.")
-            await run_setup(["npm", "install", "--omit=dev", "--no-audit", "--no-fund"], root)
-            package = json.loads(package_file.read_text(encoding="utf-8"))
-            if package.get("scripts", {}).get("start"):
-                command = ["npm", "start"]
-            else:
-                entry = (root / package.get("main", "index.js")).resolve()
-                if root.resolve() not in entry.parents or not entry.is_file():
-                    raise ValueError("Node entry file from package.json was not found.")
-                command = ["node", str(entry)]
-
-        log_path = project_dir / "runtime.log"
-        log_file = open(log_path, "ab", buffering=0)
-        process = await asyncio.create_subprocess_exec(
-            *command, cwd=str(root), env=safe_project_env(root),
-            stdout=log_file, stderr=asyncio.subprocess.STDOUT, start_new_session=True
-        )
-        hosted[interaction.user.id] = {
-            "process": process, "runtime": language.value, "log": log_path,
-            "log_file": log_file, "project_dir": project_dir,
-        }
-        await asyncio.sleep(1)
-        if process.returncode is not None:
-            tail = log_path.read_text(errors="replace")[-1300:]
-            await interaction.followup.send(
-                f"Project exited with code {process.returncode}.\n```text\n{tail[-1400:]}\n```",
-                ephemeral=True,
-            )
-        else:
-            await interaction.followup.send(
-                f"Project started inside Nexus. Runtime: **{language.value}**; PID: {process.pid}. Use /status, /logs, or /stop.",
-                ephemeral=True,
-            )
-    except Exception as exc:
-        shutil.rmtree(project_dir, ignore_errors=True)
-        message = str(exc)[-1300:]
-        await interaction.followup.send(f"Hosting failed: {type(exc).__name__}: {message}", ephemeral=True)
-    finally:
-        if archive:
-            archive.close()
-
-
-@tree.command(name="bots", description="List projects hosted by Nexus")
-async def bots_command(interaction: discord.Interaction):
-    if not is_admin(interaction):
-        await interaction.response.send_message("Not authorized.", ephemeral=True)
-        return
-    if not hosted:
-        message = "No hosted projects since Nexus last restarted."
-    else:
-        rows = []
-        for user_id, item in hosted.items():
-            process = item["process"]
-            state = "running" if process.returncode is None else f"stopped (exit {process.returncode})"
-            rows.append(f"<@{user_id}> — {item['runtime']} — {state} — PID {process.pid}")
-        message = "\n".join(rows)
-    await interaction.response.send_message(message[:1900], ephemeral=True)
-
-
-@tree.command(name="status", description="Check your hosted project's status")
-async def status_command(interaction: discord.Interaction):
-    item = hosted.get(interaction.user.id)
-    if not is_admin(interaction) or not item:
-        await interaction.response.send_message("No hosted project found for you.", ephemeral=True)
-        return
-    process = item["process"]
-    state = "running" if process.returncode is None else f"stopped (exit {process.returncode})"
-    await interaction.response.send_message(f"{item['runtime']} project: {state}; PID {process.pid}", ephemeral=True)
-
-
-@tree.command(name="stop", description="Stop your hosted project")
-async def stop_command(interaction: discord.Interaction):
-    item = hosted.get(interaction.user.id)
-    if not is_admin(interaction) or not item:
-        await interaction.response.send_message("No hosted project found for you.", ephemeral=True)
-        return
-    process = item["process"]
-    if process.returncode is None:
-        process.terminate()
-        try:
-            await asyncio.wait_for(process.wait(), timeout=8)
-        except asyncio.TimeoutError:
-            process.kill()
-            await process.wait()
-    if not item["log_file"].closed:
-        item["log_file"].close()
-    await interaction.response.send_message("Project stopped.", ephemeral=True)
-
-
-@tree.command(name="logs", description="Show recent logs from your hosted project")
-@app_commands.describe(lines="Number of recent lines (1–25)")
-async def logs_command(interaction: discord.Interaction, lines: app_commands.Range[int, 1, 25] = 15):
-    item = hosted.get(interaction.user.id)
-    if not is_admin(interaction) or not item:
-        await interaction.response.send_message("No hosted project found for you.", ephemeral=True)
-        return
-    try:
-        content = item["log"].read_text(errors="replace")
-    except OSError:
-        content = "No logs yet."
-    tail = "\n".join(content.splitlines()[-lines:]) or "No output yet."
-    await interaction.response.send_message(f"```text\n{tail[-1750:]}\n```", ephemeral=True)
+    print(f"Nexus online as {client.user} | backend: {tools.B.name} | owners: {len(OWNERS)}")
 
 
 @client.event
-async def on_message(message: discord.Message):
-    if message.author.bot or message.author.id not in ADMINS:
+async def on_message(m: discord.Message):
+    if m.author.bot or not await db.get_role(m.author.id):
         return
-    addressed = (
-        message.guild is None or client.user in message.mentions
-        or agent.has_pending(message.channel.id, message.author.id)
-    )
-    if not addressed:
+    if not (m.guild is None or client.user in m.mentions or agent.has_pending(m.channel.id, m.author.id)):
         return
-    text = message.content.replace(f"<@{client.user.id}>", "").replace(f"<@!{client.user.id}>", "").strip()
+    text = m.content.replace(f"<@{client.user.id}>", "").replace(f"<@!{client.user.id}>", "").strip()
     if not text:
         return
-    async with locks.setdefault(message.channel.id, asyncio.Lock()):
-        async with message.channel.typing():
-            try:
-                reply = await agent.handle(message.channel.id, message.author.id, text)
-            except Exception as exc:
-                reply = f"Something broke ({type(exc).__name__}). Check console."
-                print("agent error:", repr(exc))
-    chunks = [reply[i:i + 1900] for i in range(0, len(reply), 1900)] or ["..."]
-    await message.reply(chunks[0], mention_author=False)
-    for chunk in chunks[1:]:
-        await message.channel.send(chunk)
+    async with m.channel.typing():
+        chunks, view = await run_agent(m.channel.id, m.author.id, text)
+    await m.reply(chunks[0], mention_author=False, view=view or MISSING)
+    for c in chunks[1:]:
+        await m.channel.send(c)
 
 
 client.run(os.environ["DISCORD_TOKEN"])

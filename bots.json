@@ -1,12 +1,4 @@
 [
-  {
-    "id": 1,
-    "name": "musicbot",
-    "service": "musicbot.service",
-    "dir": "/opt/bots/musicbot",
-    "log_file": "bot.log",
-    "config": "config.json",
-    "runtime": "python",
-    "venv": "venv"
-  }
+  {"id": 1, "name": "musicbot", "service": "musicbot.service", "dir": "/opt/bots/musicbot", "log_file": "bot.log", "config": "config.json", "runtime": "python", "venv": "venv", "health_url": ""},
+  {"id": 2, "name": "modbot", "service": "modbot.service", "dir": "/opt/bots/modbot", "log_file": "bot.log", "config": "config.json", "runtime": "python", "venv": "venv"}
 ]

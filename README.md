@@ -1,29 +1,36 @@
 # Nexus
 
-Discord ops bot: chat + tool-calling to manage hosted bots and your server.
+Discord ops bot (OpenRouter LLM + tools) for hosted bots and your server.
 
-## Run
-    pip install -r requirements.txt
-    cp .env.example .env   # fill in
-    # edit bots.json (one entry per systemd-hosted bot)
-    python bot.py
+## Deploy
+1. Upload all files to your GitHub repo (replace old ones), Render auto-redeploys.
+2. Render env vars: `DISCORD_TOKEN`, `OPENROUTER_API_KEY`, `ADMIN_IDS`, `GUILD_IDS` (+ optional ones in `.env.example`).
+3. Invite the bot with scopes `bot` + `applications.commands`.
 
-Talk to it via DM or @mention (only users in ADMIN_IDS get answers).
+## Test on Render (mock backend)
+No systemd on Render, so `BACKEND=auto` runs **simulated bots** (musicbot, modbot). Try:
+- `/panel`, `/status`, `/logs`, `/stats`
+- `/autofix auto`, then `/simulate musicbot missing_module` -> watchdog installs the package and restarts
+- `/autofix suggest`, `/simulate modbot crash` -> alert with an "Apply fix" button
+- `/simulate musicbot bad_deploy` then `/deploy musicbot` -> health check fails, auto-rollback
+- `/role @user operator`, `/audit`, `/incidents`
+Render's disk is ephemeral: the SQLite DB (roles, audit, incidents) resets on redeploy. Fine for testing.
 
-## Needed on the server
-Run Nexus as a user with passwordless sudo for just these (visudo):
+## Move to your VPS
+    pip install -r requirements.txt && cp .env.example .env
+    edit bots.json (service name, dir, log_file, config; each bot dir is a git repo for /deploy)
+    python bot.py      # run under systemd; BACKEND=auto picks real systemd control
+Passwordless sudo for the Nexus user (visudo):
 
     nexus ALL=(root) NOPASSWD: /usr/bin/systemctl start *.service, /usr/bin/systemctl stop *.service, \
-      /usr/bin/systemctl restart *.service, /usr/bin/systemctl kill *.service, \
-      /usr/sbin/shutdown
+      /usr/bin/systemctl restart *.service, /usr/bin/systemctl kill *.service, /usr/sbin/shutdown
 
-Also enable "Message Content Intent" for the bot in the Discord dev portal.
+## Roles
+viewer: status/logs/stats/incidents. operator: start/restart/stop/deploy/edit/install/panel. owner: kill, power, ssh_exec, autofix, roles, audit.
+`ADMIN_IDS` are permanent owners.
 
-## Safety, enforced in code (not just the prompt)
-- Destructive tools park as "pending" until the same admin says yes
-- ssh_exec: allowlist + metachar block + systemctl limited to registered services
-- Secrets masked in config reads and scrubbed from every tool output
-- 2 failures on the same tool stops the turn; max 8 steps per turn
-- Mentions disabled in sent messages (no @everyone)
-
-Not implemented: ping in get_status (add a heartbeat file/endpoint in your bots if you want it).
+## Safety (enforced in code)
+Role checks + audit log on every action; destructive actions need a confirm click; log text is filtered for prompt injection;
+auto-fix only installs packages the bot already lists in its requirements/package.json; max 2 auto-fixes per bot per 30 min;
+secrets redacted everywhere; per-user daily token/USD caps; model fallback chain.
+Not built: external VPS agent (by design), web dashboard, multi-server.
